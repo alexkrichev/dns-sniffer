@@ -25,7 +25,7 @@ echo "Press Ctrl+C in the sniffer terminal to stop it"
 echo
 
 # Start the DNS sniffer in background
-./dns_sniffer &
+./dns_sniffer -i lo &
 SNIFFER_PID=$!
 
 # Wait a moment for the sniffer to start
@@ -35,16 +35,26 @@ echo "Generating DNS traffic for testing..."
 echo
 
 # Test domains to query
-DOMAINS=("google.com" "github.com" "stackoverflow.com" "example.com")
+# Basic domains (should have A/AAAA records)
+BASIC_DOMAINS=("google.com" "github.com" "stackoverflow.com" "example.com")
+
+# Subdomains (may have CNAME records)
+SUBDOMAINS=("www.google.com" "www.github.com" "docs.github.com" "help.github.com")
+
+# Combine all domains for testing
+DOMAINS=("${BASIC_DOMAINS[@]}" "${SUBDOMAINS[@]}")
 
 for domain in "${DOMAINS[@]}"; do
     echo "Querying: $domain"
     
-    # Query IPv4 addresses
-    nslookup $domain > /dev/null 2>&1
+    # Query IPv4 addresses (A records)
+    dig $domain A > /dev/null 2>&1
     
-    # Query IPv6 addresses
+    # Query IPv6 addresses (AAAA records)
     dig $domain AAAA > /dev/null 2>&1
+    
+    # Query CNAME records
+    dig $domain CNAME > /dev/null 2>&1
     
     # Small delay between queries
     sleep 1

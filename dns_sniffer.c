@@ -35,35 +35,51 @@ struct dns_header {
 // DNS class
 #define DNS_CLASS_IN   1
 
+// Pcap configuration
+#define SNAPLEN        2048    // Maximum bytes to capture per packet
+#define TIMEOUT        1000    // Read timeout in milliseconds
+#define FILTER_EXP     "udp port 53 and udp[2:2] & 0x8000 != 0"  // DNS responses
+
+// Maximum header sizes for bounds checking optimization
+#define MAX_ETHERNET_HEADER    14
+#define MAX_VLAN_HEADER        4       // VLAN tag size
+#define MAX_ETHERNET_WITH_VLAN (MAX_ETHERNET_HEADER + MAX_VLAN_HEADER)
+#define MAX_IPV4_HEADER        60      // Maximum IPv4 header size (with options)
+#define MAX_IPV6_HEADER        40      // IPv6 header is fixed size
+#define MAX_DNS_HEADER         12
+
 // Global variables
 pcap_t *handle = NULL;
-int verbose = 0;
 char *dev = NULL;
 
 // Function prototypes
-void cleanup(int sig);
-void process_packet(unsigned char *user, const struct pcap_pkthdr *header, const unsigned char *packet);
-void parse_dns_packet(const unsigned char *packet, int len);
-char* extract_domain_name(const unsigned char *packet, int *offset, int max_len);
-void print_ipv4_address(uint32_t addr);
-void print_ipv6_address(const uint8_t *addr);
-void print_usage(const char *program_name);
+void cleanup(int sig);                                                    // Signal handler for graceful shutdown
+void process_packet(unsigned char *user, const struct pcap_pkthdr *header, const unsigned char *packet);  // Main packet processing callback
+void parse_dns_packet(const unsigned char *packet, int len);              // Parse DNS response packet and extract records
+char* extract_domain_name(const unsigned char *packet, int *offset, int max_len);  // Extract domain name from DNS packet
+void print_ipv4_address(uint32_t addr);                                   // Print IPv4 address in dotted decimal format
+void print_ipv6_address(const uint8_t *addr);                             // Print IPv6 address in colon-separated format
+void print_usage(const char *program_name);                               // Display program usage and available interfaces
+
+// Static function prototypes
+static void parse_ipv4_packet(const unsigned char *packet, const struct pcap_pkthdr *header, unsigned int ethernet_header_len);
+static void parse_ipv6_packet(const unsigned char *packet, const struct pcap_pkthdr *header, unsigned int ethernet_header_len);
+static const unsigned char* extract_dns_from_udp(const unsigned char *packet, const struct pcap_pkthdr *header, unsigned int ip_offset);
+static void process_answer_records(const unsigned char *packet, int len, int offset, uint16_t ancount);
+static void process_dns_record(const unsigned char *packet, int offset, uint16_t type, uint16_t rdlength, int *ipv4_count, int *ipv6_count);
 
 int main(int argc, char *argv[]) {
+    // Main entry point: initialize pcap, set up signal handlers, and start packet capture
     char errbuf[PCAP_ERRBUF_SIZE];
     struct bpf_program fp;
-    char filter_exp[] = "udp port 53";
     int opt;
     pcap_if_t *alldevs, *d;
     
     // Parse command line arguments
-    while ((opt = getopt(argc, argv, "i:vh")) != -1) {
+    while ((opt = getopt(argc, argv, "i:h")) != -1) {
         switch (opt) {
             case 'i':
                 dev = optarg;
-                break;
-            case 'v':
-                verbose = 1;
                 break;
             case 'h':
                 print_usage(argv[0]);
@@ -107,20 +123,31 @@ int main(int argc, char *argv[]) {
     printf("Press Ctrl+C to stop\n\n");
     
     // Open the device for sniffing
-    handle = pcap_open_live(dev, BUFSIZ, 1, 1000, errbuf);
+    handle = pcap_create(dev, errbuf);
     if (handle == NULL) {
-        fprintf(stderr, "Couldn't open device %s: %s\n", dev, errbuf);
+        fprintf(stderr, "Couldn't create pcap handle: %s\n", errbuf);
+        return EXIT_FAILURE;
+    }
+    
+    // Configure the handle
+    pcap_set_snaplen(handle, SNAPLEN);
+    pcap_set_timeout(handle, TIMEOUT);
+    
+    // Activate the handle
+    if (pcap_activate(handle) != 0) {
+        fprintf(stderr, "Couldn't activate pcap handle: %s\n", pcap_geterr(handle));
+        pcap_close(handle);
         return EXIT_FAILURE;
     }
     
     // Compile and apply the filter
-    if (pcap_compile(handle, &fp, filter_exp, 0, PCAP_NETMASK_UNKNOWN) == -1) {
-        fprintf(stderr, "Couldn't parse filter %s: %s\n", filter_exp, pcap_geterr(handle));
+    if (pcap_compile(handle, &fp, FILTER_EXP, 0, PCAP_NETMASK_UNKNOWN) == -1) {
+        fprintf(stderr, "Couldn't parse filter %s: %s\n", FILTER_EXP, pcap_geterr(handle));
         return EXIT_FAILURE;
     }
     
     if (pcap_setfilter(handle, &fp) == -1) {
-        fprintf(stderr, "Couldn't install filter %s: %s\n", filter_exp, pcap_geterr(handle));
+        fprintf(stderr, "Couldn't install filter %s: %s\n", FILTER_EXP, pcap_geterr(handle));
         return EXIT_FAILURE;
     }
     
@@ -132,6 +159,7 @@ int main(int argc, char *argv[]) {
 }
 
 void cleanup(int sig) {
+    // Signal handler: gracefully close pcap handle and exit
     (void)sig;  // Suppress unused parameter warning
     printf("\nShutting down DNS sniffer...\n");
     if (handle) {
@@ -145,63 +173,104 @@ void cleanup(int sig) {
 }
 
 void process_packet(unsigned char *user, const struct pcap_pkthdr *header, const unsigned char *packet) {
+    // Pcap callback: extract DNS packet from Ethernet frame and parse it
     (void)user;    // Suppress unused parameter warning
-    (void)header;  // Suppress unused parameter warning
-    struct iphdr *ip_header;
-    struct udphdr *udp_header;
-    int ip_header_len;
-    int udp_header_len = sizeof(struct udphdr);
-    int dns_packet_len;
-    const unsigned char *dns_packet;
     
-    // Determine if it's IPv4 or IPv6
-    if ((packet[12] << 8 | packet[13]) == 0x0800) {  // IPv4
-        ip_header = (struct iphdr *)(packet + 14);  // Skip Ethernet header
-        ip_header_len = ip_header->ihl * 4;
-        udp_header = (struct udphdr *)(packet + 14 + ip_header_len);
-        dns_packet = packet + 14 + ip_header_len + udp_header_len;
-        dns_packet_len = ntohs(udp_header->uh_ulen) - udp_header_len;
-    } else if ((packet[12] << 8 | packet[13]) == 0x86DD) {  // IPv6
-        udp_header = (struct udphdr *)(packet + 14 + sizeof(struct ip6_hdr));
-        dns_packet = packet + 14 + sizeof(struct ip6_hdr) + udp_header_len;
-        dns_packet_len = ntohs(udp_header->uh_ulen) - udp_header_len;
-    } else {
-        return;  // Not IPv4 or IPv6
+    // Basic bounds check: ensure we have enough data for minimum headers
+    if (header->caplen < 60) {  // Minimum reasonable packet size
+        printf("DROP: Packet too short (len=%d, min=60)\n", header->caplen);
+        return;  // Packet too short
     }
     
-    // Parse DNS packet
-    parse_dns_packet(dns_packet, dns_packet_len);
+    // Determine Ethernet header length and get EtherType
+    unsigned int ethernet_header_len = MAX_ETHERNET_HEADER;
+    uint16_t ethertype = (packet[12] << 8) | packet[13];
+    
+    if (ethertype == 0x8100) {  // VLAN tag present
+        ethernet_header_len = MAX_ETHERNET_WITH_VLAN;
+        ethertype = (packet[16] << 8) | packet[17]; // EtherType after VLAN tag
+    }
+    
+    // Parse based on IP version
+    if (ethertype == 0x0800) {  // IPv4
+        parse_ipv4_packet(packet, header, ethernet_header_len);
+    } else if (ethertype == 0x86DD) {  // IPv6
+        parse_ipv6_packet(packet, header, ethernet_header_len);
+    } else {
+        printf("DROP: Unknown EtherType 0x%04x\n", ethertype);
+    }
+    // Ignore other protocols
+}
+
+static void parse_ipv4_packet(const unsigned char *packet, const struct pcap_pkthdr *header, unsigned int ethernet_header_len) {
+    struct iphdr *ip_header = (struct iphdr *)(packet + ethernet_header_len);
+    unsigned int ip_header_len = ip_header->ihl * 4;
+    
+    // Validate IP header length
+    if (ip_header_len < sizeof(struct iphdr) || ip_header_len > MAX_IPV4_HEADER) {
+        printf("DROP: Invalid IPv4 header length %d\n", ip_header_len);
+        return;  // Invalid IP header length
+    }
+    
+    // Extract and validate DNS packet
+    const unsigned char *dns_packet = extract_dns_from_udp(packet, header, ethernet_header_len + ip_header_len);
+    if (dns_packet) {
+        parse_dns_packet(dns_packet, header->caplen - (ethernet_header_len + ip_header_len + sizeof(struct udphdr)));
+    } else {
+        printf("DROP: Invalid DNS packet from IPv4\n");
+    }
+}
+
+static void parse_ipv6_packet(const unsigned char *packet, const struct pcap_pkthdr *header, unsigned int ethernet_header_len) {
+    // Extract and validate DNS packet
+    const unsigned char *dns_packet = extract_dns_from_udp(packet, header, ethernet_header_len + MAX_IPV6_HEADER);
+    if (dns_packet) {
+        parse_dns_packet(dns_packet, header->caplen - (ethernet_header_len + MAX_IPV6_HEADER + sizeof(struct udphdr)));
+    } else {
+        printf("DROP: Invalid DNS packet from IPv6\n");
+    }
+}
+
+static const unsigned char* extract_dns_from_udp(const unsigned char *packet, const struct pcap_pkthdr *header, unsigned int ip_offset) {
+    struct udphdr *udp_header = (struct udphdr *)(packet + ip_offset);
+    int dns_packet_len = ntohs(udp_header->uh_ulen) - sizeof(struct udphdr);
+    
+    // Validate DNS packet length
+    if (dns_packet_len <= 0 || (unsigned int)dns_packet_len > header->caplen - (ip_offset + sizeof(struct udphdr))) {
+        printf("DROP: Invalid DNS packet length %d (caplen=%d, ip_offset=%d)\n", dns_packet_len, header->caplen, ip_offset);
+        return NULL;  // Invalid DNS packet length
+    }
+    
+    return packet + ip_offset + sizeof(struct udphdr);
 }
 
 void parse_dns_packet(const unsigned char *packet, int len) {
-    if ((size_t)len < sizeof(struct dns_header)) {
+    // Parse DNS response: extract domain names, A/AAAA records, and CNAME records
+    if (len < MAX_DNS_HEADER) {
+        printf("DROP: DNS packet too short (len=%d, min=%d)\n", len, MAX_DNS_HEADER);
         return;
     }
     
     struct dns_header *dns_hdr = (struct dns_header *)packet;
     
-    // Check if this is a response packet
-    if (!(ntohs(dns_hdr->flags) & DNS_QR_RESPONSE)) {
-        return;  // Not a response packet
+    // Validate DNS header fields to prevent processing malformed packets
+    uint16_t qcount = ntohs(dns_hdr->qcount);
+    uint16_t ancount = ntohs(dns_hdr->ancount);
+    
+    // Sanity check: DNS packets shouldn't have unreasonable numbers of records
+    if (qcount > 100 || ancount > 100) {
+        printf("DROP: Suspicious DNS packet (qcount=%d, ancount=%d)\n", qcount, ancount);
+        return;  // Suspicious DNS packet with too many records
     }
     
-    // Check if there are any answer records
-    if (ntohs(dns_hdr->ancount) == 0) {
-        return;  // No answer records
-    }
+    int offset = MAX_DNS_HEADER;
     
-    int offset = sizeof(struct dns_header);
-    
-    // Skip questions section
-    for (int i = 0; i < ntohs(dns_hdr->qcount); i++) {
-        if (offset >= len) return;
-        
-        // Extract domain name from question
+    // Skip questions section and print first domain
+    for (int i = 0; i < qcount; i++) {
         char *domain = extract_domain_name(packet, &offset, len);
         if (domain == NULL) return;
         
-        // Skip QTYPE and QCLASS (4 bytes)
-        offset += 4;
+        offset += 4;  // Skip QTYPE and QCLASS
         if (offset >= len) {
             free(domain);
             return;
@@ -214,58 +283,45 @@ void parse_dns_packet(const unsigned char *packet, int len) {
     }
     
     // Process answer records
+    process_answer_records(packet, len, offset, ancount);
+    printf("\n");
+}
+
+static void process_answer_records(const unsigned char *packet, int len, int offset, uint16_t ancount) {
     int ipv4_count = 0;
     int ipv6_count = 0;
     
-    for (int i = 0; i < ntohs(dns_hdr->ancount); i++) {
-        if (offset >= len) break;
+    for (int i = 0; i < ancount; i++) {
+        if (offset >= len) {
+            break;
+        }
         
         // Skip the domain name in the answer
         char *answer_domain = extract_domain_name(packet, &offset, len);
-        if (answer_domain == NULL) break;
+        if (answer_domain == NULL) {
+            break;
+        }
         free(answer_domain);
         
-        if (offset + 10 >= len) break;  // Need at least 10 bytes for TYPE, CLASS, TTL, RDLENGTH
+        if (offset + 10 >= len) {
+            break;  // Need at least 10 bytes for TYPE, CLASS, TTL, RDLENGTH
+        }
         
-        // Extract record type and class
+        // Extract record information
         uint16_t type = ntohs(*(uint16_t *)(packet + offset));
         uint16_t class = ntohs(*(uint16_t *)(packet + offset + 2));
         uint16_t rdlength = ntohs(*(uint16_t *)(packet + offset + 8));
         
         offset += 10;
         
-        if (offset + rdlength > len) break;
+        // Validate RDATA length
+        if (offset + rdlength > len) {
+            break;
+        }
         
         // Process based on record type
         if (class == DNS_CLASS_IN) {
-            switch (type) {
-                case DNS_TYPE_A:
-                    if (rdlength == 4) {
-                        if (ipv4_count == 0) {
-                            printf("IPv4 addresses:\n");
-                        }
-                        uint32_t ipv4_addr = *(uint32_t *)(packet + offset);
-                        print_ipv4_address(ipv4_addr);
-                        ipv4_count++;
-                    }
-                    break;
-                    
-                case DNS_TYPE_AAAA:
-                    if (rdlength == 16) {
-                        if (ipv6_count == 0) {
-                            printf("IPv6 addresses:\n");
-                        }
-                        print_ipv6_address(packet + offset);
-                        ipv6_count++;
-                    }
-                    break;
-                    
-                case DNS_TYPE_CNAME:
-                    if (verbose) {
-                        printf("CNAME record found\n");
-                    }
-                    break;
-            }
+            process_dns_record(packet, offset, type, rdlength, &ipv4_count, &ipv6_count);
         }
         
         offset += rdlength;
@@ -275,12 +331,54 @@ void parse_dns_packet(const unsigned char *packet, int len) {
     if (ipv4_count == 0 && ipv6_count == 0) {
         printf("No IP addresses found\n");
     }
-    printf("\n");
+}
+
+static void process_dns_record(const unsigned char *packet, int offset, uint16_t type, uint16_t rdlength, int *ipv4_count, int *ipv6_count) {
+    switch (type) {
+        case DNS_TYPE_A:
+            if (rdlength == 4) {
+                if (*ipv4_count == 0) {
+                    printf("IPv4 addresses:\n");
+                }
+                uint32_t ipv4_addr = *(uint32_t *)(packet + offset);
+                print_ipv4_address(ipv4_addr);
+                (*ipv4_count)++;
+            }
+            break;
+            
+        case DNS_TYPE_AAAA:
+            if (rdlength == 16) {
+                if (*ipv6_count == 0) {
+                    printf("IPv6 addresses:\n");
+                }
+                print_ipv6_address(packet + offset);
+                (*ipv6_count)++;
+            }
+            break;
+            
+        case DNS_TYPE_CNAME:
+            if (rdlength > 0) {
+                // Extract the CNAME target domain
+                int temp_offset = offset;
+                char *cname_target = extract_domain_name(packet, &temp_offset, offset + rdlength);
+                if (cname_target) {
+                    printf("CNAME: %s\n", cname_target);
+                    free(cname_target);
+                }
+            }
+            break;
+    }
 }
 
 char* extract_domain_name(const unsigned char *packet, int *offset, int max_len) {
+    // Extract domain name from DNS packet, handling compression pointers
     char domain[256] = {0};
-    int domain_len = 0;
+    unsigned int domain_len = 0;
+    
+    // Check if offset is within bounds
+    if (*offset >= max_len) {
+        return NULL;
+    }
     
     while (*offset < max_len) {
         uint8_t len = packet[*offset];
@@ -296,6 +394,11 @@ char* extract_domain_name(const unsigned char *packet, int *offset, int max_len)
             uint16_t pointer = ((len & 0x3F) << 8) | packet[*offset];
             (*offset)++;
             
+            // Validate pointer is within bounds and not pointing to itself
+            if (pointer >= max_len || pointer >= *offset - 2) {
+                return NULL;  // Invalid compression pointer
+            }
+            
             // Follow the pointer
             int temp_offset = pointer;
             char *compressed_part = extract_domain_name(packet, &temp_offset, max_len);
@@ -309,7 +412,13 @@ char* extract_domain_name(const unsigned char *packet, int *offset, int max_len)
             break;
         }
         
+        // Check if we have enough data for this label
         if (*offset + len > max_len) return NULL;
+        
+        // Check if adding this label would exceed domain buffer
+        if (domain_len + len + 1 >= sizeof(domain)) {
+            return NULL;  // Domain name too long
+        }
         
         if (domain_len > 0) {
             domain[domain_len++] = '.';
@@ -328,12 +437,14 @@ char* extract_domain_name(const unsigned char *packet, int *offset, int max_len)
 }
 
 void print_ipv4_address(uint32_t addr) {
+    // Convert and print IPv4 address from network byte order to dotted decimal
     struct in_addr in_addr;
     in_addr.s_addr = addr;
     printf("  %s\n", inet_ntoa(in_addr));
 }
 
 void print_ipv6_address(const uint8_t *addr) {
+    // Convert and print IPv6 address from binary to colon-separated hex format
     char ipv6_str[INET6_ADDRSTRLEN];
     struct in6_addr in6_addr;
     memcpy(&in6_addr, addr, 16);
@@ -344,13 +455,13 @@ void print_ipv6_address(const uint8_t *addr) {
 }
 
 void print_usage(const char *program_name) {
+    // Display program usage information and list available network interfaces
     pcap_if_t *alldevs, *d;
     char errbuf[PCAP_ERRBUF_SIZE];
     
     printf("Usage: %s [options]\n", program_name);
     printf("Options:\n");
     printf("  -i <interface>  Specify network interface to capture on\n");
-    printf("  -v              Verbose output\n");
     printf("  -h              Show this help message\n");
     printf("\nExample: %s -i eth0\n", program_name);
     
