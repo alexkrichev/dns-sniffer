@@ -30,7 +30,6 @@ struct dns_header {
 // DNS record types
 #define DNS_TYPE_A     1
 #define DNS_TYPE_AAAA  28
-#define DNS_TYPE_CNAME 5
 
 // DNS class
 #define DNS_CLASS_IN   1
@@ -353,18 +352,6 @@ static void process_dns_record(const unsigned char *packet, int offset, uint16_t
                 }
                 print_ipv6_address(packet + offset);
                 (*ipv6_count)++;
-            }
-            break;
-            
-        case DNS_TYPE_CNAME:
-            if (rdlength > 0) {
-                // Extract the CNAME target domain
-                int temp_offset = offset;
-                char *cname_target = extract_domain_name(packet, &temp_offset, offset + rdlength);
-                if (cname_target) {
-                    printf("CNAME: %s\n", cname_target);
-                    free(cname_target);
-                }
             }
             break;
     }
