@@ -333,63 +333,33 @@ static int process_answer_records(const unsigned char *packet, int len, int *off
             break;
         }
         
-        // Skip the domain name in the answer
-        char *answer_domain = extract_domain_name(packet, offset, len);
-        if (answer_domain == NULL) {
-            // Fallback: try to parse the record structure even without domain name
-            // Look for the record header pattern
-            int fallback_offset = *offset;
-            while (fallback_offset < len && fallback_offset + 10 < len) {
-                uint16_t potential_type = ntohs(*(uint16_t *)(packet + fallback_offset));
-                uint16_t potential_class = ntohs(*(uint16_t *)(packet + fallback_offset + 2));
-                uint16_t potential_rdlength = ntohs(*(uint16_t *)(packet + fallback_offset + 8));
-                
-                // Check if this looks like a valid record header
-                if (potential_type > 0 && potential_type < 100 && 
-                    potential_class == DNS_CLASS_IN && 
-                    potential_rdlength < 1000 && 
-                    fallback_offset + 10 + potential_rdlength <= len) {
-                    
-                    // Process this record
-                    if (potential_class == DNS_CLASS_IN) {
-                        process_dns_record(packet, fallback_offset + 10, potential_type, potential_rdlength, &ipv4_count, &ipv6_count);
-                    }
-                    
-                    *offset = fallback_offset + 10 + potential_rdlength;
-                    break;
-                }
-                fallback_offset++;
-            }
+        // Find and process DNS record headers (skip domain names due to compression)
+        int search_offset = *offset;
+        while (search_offset < len && search_offset + 10 < len) {
+            uint16_t potential_type = ntohs(*(uint16_t *)(packet + search_offset));
+            uint16_t potential_class = ntohs(*(uint16_t *)(packet + search_offset + 2));
+            uint16_t potential_rdlength = ntohs(*(uint16_t *)(packet + search_offset + 8));
             
-            if (fallback_offset >= len) {
+            // Check if this looks like a valid record header
+            if (potential_type > 0 && potential_type < 100 && 
+                potential_class == DNS_CLASS_IN && 
+                potential_rdlength < 1000 && 
+                search_offset + 10 + potential_rdlength <= len) {
+                
+                // Process this record
+                if (potential_class == DNS_CLASS_IN) {
+                    process_dns_record(packet, search_offset + 10, potential_type, potential_rdlength, &ipv4_count, &ipv6_count);
+                }
+                
+                *offset = search_offset + 10 + potential_rdlength;
                 break;
             }
-            continue;
-        }
-        free(answer_domain);
-        
-        if (*offset + 10 >= len) {
-            break;  // Need at least 10 bytes for TYPE, CLASS, TTL, RDLENGTH
+            search_offset++;
         }
         
-        // Extract record information
-        uint16_t type = ntohs(*(uint16_t *)(packet + *offset));
-        uint16_t class = ntohs(*(uint16_t *)(packet + *offset + 2));
-        uint16_t rdlength = ntohs(*(uint16_t *)(packet + *offset + 8));
-        
-        *offset += 10;
-        
-        // Validate RDATA length
-        if (*offset + rdlength > len) {
+        if (search_offset >= len) {
             break;
         }
-        
-        // Process based on record type
-        if (class == DNS_CLASS_IN) {
-            process_dns_record(packet, *offset, type, rdlength, &ipv4_count, &ipv6_count);
-        }
-        
-        *offset += rdlength;
     }
     
     return ipv4_count + ipv6_count;  // Return the count of addresses found
