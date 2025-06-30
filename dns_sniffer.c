@@ -39,13 +39,12 @@ struct dns_header {
 #define TIMEOUT        1000    // Read timeout in milliseconds
 #define FILTER_EXP     "udp port 53 and udp[2:2] & 0x8000 != 0"  // DNS responses
 
-// Maximum header sizes for bounds checking optimization
-#define MAX_ETHERNET_HEADER    14
-#define MAX_VLAN_HEADER        4       // VLAN tag size
-#define MAX_ETHERNET_WITH_VLAN (MAX_ETHERNET_HEADER + MAX_VLAN_HEADER)
-#define MAX_IPV4_HEADER        60      // Maximum IPv4 header size (with options)
-#define MAX_IPV6_HEADER        40      // IPv6 header is fixed size
-#define MAX_DNS_HEADER         12
+// Header sizes for bounds checking
+#define ETH_HEADER_LEN     14
+#define VLAN_HEADER_LEN    4
+#define IPV4_HEADER_LEN    20
+#define IPV6_HEADER_LEN    40
+#define DNS_HEADER_LEN     12
 
 // Global variables
 pcap_t *handle = NULL;
@@ -54,6 +53,7 @@ int dev_allocated = 0;  // Flag to track if dev was dynamically allocated
 
 // Function prototypes
 void cleanup(int sig);                                                    // Signal handler for graceful shutdown
+void cleanup_resources(void);                                             // Cleanup resources without exit
 void process_packet(unsigned char *user, const struct pcap_pkthdr *header, const unsigned char *packet);  // Main packet processing callback
 void parse_dns_packet(const unsigned char *packet, int len);              // Parse DNS response packet and extract records
 char* extract_domain_name(const unsigned char *packet, int *offset, int max_len);  // Extract domain name from DNS packet
@@ -127,6 +127,7 @@ int main(int argc, char *argv[]) {
     handle = pcap_create(dev, errbuf);
     if (handle == NULL) {
         fprintf(stderr, "Couldn't create pcap handle: %s\n", errbuf);
+        cleanup_resources();
         return EXIT_FAILURE;
     }
     
@@ -137,18 +138,20 @@ int main(int argc, char *argv[]) {
     // Activate the handle
     if (pcap_activate(handle) != 0) {
         fprintf(stderr, "Couldn't activate pcap handle: %s\n", pcap_geterr(handle));
-        pcap_close(handle);
+        cleanup_resources();
         return EXIT_FAILURE;
     }
     
     // Compile and apply the filter
     if (pcap_compile(handle, &fp, FILTER_EXP, 0, PCAP_NETMASK_UNKNOWN) == -1) {
         fprintf(stderr, "Couldn't parse filter %s: %s\n", FILTER_EXP, pcap_geterr(handle));
+        cleanup_resources();
         return EXIT_FAILURE;
     }
     
     if (pcap_setfilter(handle, &fp) == -1) {
         fprintf(stderr, "Couldn't install filter %s: %s\n", FILTER_EXP, pcap_geterr(handle));
+        cleanup_resources();
         return EXIT_FAILURE;
     }
     
@@ -156,20 +159,30 @@ int main(int argc, char *argv[]) {
     printf("Waiting for DNS response packets...\n\n");
     pcap_loop(handle, -1, process_packet, NULL);
     
+    // This point should never be reached due to pcap_loop running indefinitely
+    // But if it is, clean up properly
+    cleanup_resources();
     return EXIT_SUCCESS;
+}
+
+void cleanup_resources(void) {
+    // Cleanup resources without exiting
+    if (handle) {
+        pcap_close(handle);
+        handle = NULL;
+    }
+    if (dev && dev_allocated) {
+        free(dev);
+        dev = NULL;
+        dev_allocated = 0;
+    }
 }
 
 void cleanup(int sig) {
     // Signal handler: gracefully close pcap handle and exit
     (void)sig;  // Suppress unused parameter warning
     printf("\nShutting down DNS sniffer...\n");
-    if (handle) {
-        pcap_close(handle);
-    }
-    // Free the device name if it was allocated
-    if (dev && dev_allocated) {
-        free(dev);
-    }
+    cleanup_resources();
     exit(EXIT_SUCCESS);
 }
 
@@ -184,11 +197,11 @@ void process_packet(unsigned char *user, const struct pcap_pkthdr *header, const
     }
     
     // Determine Ethernet header length and get EtherType
-    unsigned int ethernet_header_len = MAX_ETHERNET_HEADER;
+    unsigned int ethernet_header_len = ETH_HEADER_LEN;
     uint16_t ethertype = (packet[12] << 8) | packet[13];
     
     if (ethertype == 0x8100) {  // VLAN tag present
-        ethernet_header_len = MAX_ETHERNET_WITH_VLAN;
+        ethernet_header_len = ETH_HEADER_LEN + VLAN_HEADER_LEN;
         ethertype = (packet[16] << 8) | packet[17]; // EtherType after VLAN tag
     }
     
@@ -207,10 +220,10 @@ static void parse_ipv4_packet(const unsigned char *packet, const struct pcap_pkt
     struct iphdr *ip_header = (struct iphdr *)(packet + ethernet_header_len);
     unsigned int ip_header_len = ip_header->ihl * 4;
     
-    // Validate IP header length
-    if (ip_header_len < sizeof(struct iphdr) || ip_header_len > MAX_IPV4_HEADER) {
+    // Simple bounds check for IP header
+    if (ip_header_len < IPV4_HEADER_LEN || ip_header_len > 60) {
         printf("DROP: Invalid IPv4 header length %d\n", ip_header_len);
-        return;  // Invalid IP header length
+        return;
     }
     
     // Extract and validate DNS packet
@@ -223,10 +236,17 @@ static void parse_ipv4_packet(const unsigned char *packet, const struct pcap_pkt
 }
 
 static void parse_ipv6_packet(const unsigned char *packet, const struct pcap_pkthdr *header, unsigned int ethernet_header_len) {
+    // Simple IPv6 parsing - assume no extension headers (most DNS packets)
+    // Check if we have enough data for IPv6 header + UDP header
+    if (header->caplen < ethernet_header_len + IPV6_HEADER_LEN + sizeof(struct udphdr)) {
+        printf("DROP: IPv6 packet too short\n");
+        return;
+    }
+    
     // Extract and validate DNS packet
-    const unsigned char *dns_packet = extract_dns_from_udp(packet, header, ethernet_header_len + MAX_IPV6_HEADER);
+    const unsigned char *dns_packet = extract_dns_from_udp(packet, header, ethernet_header_len + IPV6_HEADER_LEN);
     if (dns_packet) {
-        parse_dns_packet(dns_packet, header->caplen - (ethernet_header_len + MAX_IPV6_HEADER + sizeof(struct udphdr)));
+        parse_dns_packet(dns_packet, header->caplen - (ethernet_header_len + IPV6_HEADER_LEN + sizeof(struct udphdr)));
     } else {
         printf("DROP: Invalid DNS packet from IPv6\n");
     }
@@ -247,8 +267,8 @@ static const unsigned char* extract_dns_from_udp(const unsigned char *packet, co
 
 void parse_dns_packet(const unsigned char *packet, int len) {
     // Parse DNS response: extract domain names, A/AAAA records
-    if (len < MAX_DNS_HEADER) {
-        printf("DROP: DNS packet too short (len=%d, min=%d)\n", len, MAX_DNS_HEADER);
+    if (len < DNS_HEADER_LEN) {
+        printf("DROP: DNS packet too short (len=%d, min=%d)\n", len, DNS_HEADER_LEN);
         return;
     }
     
@@ -259,12 +279,12 @@ void parse_dns_packet(const unsigned char *packet, int len) {
     uint16_t ancount = ntohs(dns_hdr->ancount);
     
     // Sanity check: DNS packets shouldn't have unreasonable numbers of records
-    if (qcount > 100 || ancount > 100) {
-        printf("DROP: Suspicious DNS packet (qcount=%d, ancount=%d)\n", qcount, ancount);
-        return;  // Suspicious DNS packet with too many records
+    if (qcount > 10 || ancount > 20) {
+        printf("DROP: Too many DNS records (qcount=%d, ancount=%d)\n", qcount, ancount);
+        return;  // Too many records
     }
     
-    int offset = MAX_DNS_HEADER;
+    int offset = DNS_HEADER_LEN;
     
     // Skip questions section and print first domain
     for (int i = 0; i < qcount; i++) {
@@ -360,9 +380,10 @@ static void process_dns_record(const unsigned char *packet, int offset, uint16_t
 }
 
 char* extract_domain_name(const unsigned char *packet, int *offset, int max_len) {
-    // Extract domain name from DNS packet, handling compression pointers
+    // Extract domain name from DNS packet with basic compression support
     char domain[256] = {0};
     unsigned int domain_len = 0;
+    int original_offset = *offset;
     
     // Check if offset is within bounds
     if (*offset >= max_len) {
@@ -377,26 +398,40 @@ char* extract_domain_name(const unsigned char *packet, int *offset, int max_len)
             break;  // End of domain name
         }
         
+        // Handle compression pointer (simplified)
         if (len & 0xC0) {
-            // Compression pointer
             if (*offset >= max_len) return NULL;
             uint16_t pointer = ((len & 0x3F) << 8) | packet[*offset];
             (*offset)++;
             
-            // Validate pointer is within bounds and not pointing to itself
-            if (pointer >= max_len || pointer >= *offset - 2) {
-                return NULL;  // Invalid compression pointer
+            // Basic pointer validation
+            if (pointer >= max_len || pointer >= original_offset) {
+                return NULL;
             }
             
-            // Follow the pointer
+            // Follow pointer once (no recursion to avoid complexity)
             int temp_offset = pointer;
-            char *compressed_part = extract_domain_name(packet, &temp_offset, max_len);
-            if (compressed_part) {
-                if (domain_len > 0) {
-                    strcat(domain, ".");
+            while (temp_offset < max_len) {
+                uint8_t temp_len = packet[temp_offset];
+                temp_offset++;
+                
+                if (temp_len == 0) break;
+                
+                if (temp_len & 0xC0) {
+                    // Nested compression not supported (simplified)
+                    return NULL;
                 }
-                strcat(domain, compressed_part);
-                free(compressed_part);
+                
+                if (temp_offset + temp_len > max_len) return NULL;
+                if (domain_len + temp_len + 1 >= sizeof(domain)) return NULL;
+                
+                if (domain_len > 0) {
+                    domain[domain_len++] = '.';
+                }
+                
+                memcpy(domain + domain_len, packet + temp_offset, temp_len);
+                domain_len += temp_len;
+                temp_offset += temp_len;
             }
             break;
         }
