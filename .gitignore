@@ -1,0 +1,27 @@
+# Compiled binaries
+dns_sniffer
+
+# PCAP files (test data)
+*.pcap
+
+# Valgrind output
+valgrind_output.txt
+
+# Object files
+*.o
+
+# Debug files
+*.dSYM/
+
+# IDE files
+.vscode/
+.idea/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db 
