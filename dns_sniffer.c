@@ -29,6 +29,7 @@ struct dns_header {
 
 // DNS record types
 #define DNS_TYPE_A     1
+#define DNS_TYPE_CNAME 5
 #define DNS_TYPE_AAAA  28
 
 // DNS class
@@ -51,7 +52,7 @@ pcap_t *handle = NULL;
 char *dev = NULL;
 int dev_allocated = 0;  // Flag to track if dev was dynamically allocated
 
-// Function prototypes
+// Function declarations
 void cleanup(int sig);                                                    // Signal handler for graceful shutdown
 void cleanup_resources(void);                                             // Cleanup resources without exit
 void process_packet(unsigned char *user, const struct pcap_pkthdr *header, const unsigned char *packet);  // Main packet processing callback
@@ -65,8 +66,9 @@ void print_usage(const char *program_name);                               // Dis
 static void parse_ipv4_packet(const unsigned char *packet, const struct pcap_pkthdr *header, unsigned int ethernet_header_len);
 static void parse_ipv6_packet(const unsigned char *packet, const struct pcap_pkthdr *header, unsigned int ethernet_header_len);
 static const unsigned char* extract_dns_from_udp(const unsigned char *packet, const struct pcap_pkthdr *header, unsigned int ip_offset);
-static void process_answer_records(const unsigned char *packet, int len, int offset, uint16_t ancount);
+static int process_answer_records(const unsigned char *packet, int len, int *offset, uint16_t ancount);
 static void process_dns_record(const unsigned char *packet, int offset, uint16_t type, uint16_t rdlength, int *ipv4_count, int *ipv6_count);
+static int skip_dns_records(const unsigned char *packet, int len, int offset, uint16_t count);
 
 int main(int argc, char *argv[]) {
     // Main entry point: initialize pcap, set up signal handlers, and start packet capture
@@ -277,10 +279,12 @@ void parse_dns_packet(const unsigned char *packet, int len) {
     // Validate DNS header fields to prevent processing malformed packets
     uint16_t qcount = ntohs(dns_hdr->qcount);
     uint16_t ancount = ntohs(dns_hdr->ancount);
+    uint16_t nscount = ntohs(dns_hdr->nscount);
+    uint16_t arcount = ntohs(dns_hdr->arcount);
     
     // Sanity check: DNS packets shouldn't have unreasonable numbers of records
-    if (qcount > 10 || ancount > 20) {
-        printf("DROP: Too many DNS records (qcount=%d, ancount=%d)\n", qcount, ancount);
+    if (qcount > 10 || ancount > 20 || nscount > 20 || arcount > 20) {
+        printf("DROP: Too many DNS records (qcount=%d, ancount=%d, nscount=%d, arcount=%d)\n", qcount, ancount, nscount, arcount);
         return;  // Too many records
     }
     
@@ -304,63 +308,97 @@ void parse_dns_packet(const unsigned char *packet, int len) {
     }
     
     // Process answer records
-    process_answer_records(packet, len, offset, ancount);
+    int answer_addresses = process_answer_records(packet, len, &offset, ancount);
+    
+    // Skip authority records (they don't contain IP addresses)
+    offset = skip_dns_records(packet, len, offset, nscount);
+    
+    // Process additional records (may contain A/AAAA records)
+    int additional_addresses = process_answer_records(packet, len, &offset, arcount);
+    
+    int total_addresses = answer_addresses + additional_addresses;
+    
+    if (total_addresses == 0) {
+        printf("No IP addresses found\n");
+    }
     printf("\n");
 }
 
-static void process_answer_records(const unsigned char *packet, int len, int offset, uint16_t ancount) {
+static int process_answer_records(const unsigned char *packet, int len, int *offset, uint16_t ancount) {
     int ipv4_count = 0;
     int ipv6_count = 0;
     
     for (int i = 0; i < ancount; i++) {
-        if (offset >= len) {
+        if (*offset >= len) {
             break;
         }
         
         // Skip the domain name in the answer
-        char *answer_domain = extract_domain_name(packet, &offset, len);
+        char *answer_domain = extract_domain_name(packet, offset, len);
         if (answer_domain == NULL) {
-            break;
+            // Fallback: try to parse the record structure even without domain name
+            // Look for the record header pattern
+            int fallback_offset = *offset;
+            while (fallback_offset < len && fallback_offset + 10 < len) {
+                uint16_t potential_type = ntohs(*(uint16_t *)(packet + fallback_offset));
+                uint16_t potential_class = ntohs(*(uint16_t *)(packet + fallback_offset + 2));
+                uint16_t potential_rdlength = ntohs(*(uint16_t *)(packet + fallback_offset + 8));
+                
+                // Check if this looks like a valid record header
+                if (potential_type > 0 && potential_type < 100 && 
+                    potential_class == DNS_CLASS_IN && 
+                    potential_rdlength < 1000 && 
+                    fallback_offset + 10 + potential_rdlength <= len) {
+                    
+                    // Process this record
+                    if (potential_class == DNS_CLASS_IN) {
+                        process_dns_record(packet, fallback_offset + 10, potential_type, potential_rdlength, &ipv4_count, &ipv6_count);
+                    }
+                    
+                    *offset = fallback_offset + 10 + potential_rdlength;
+                    break;
+                }
+                fallback_offset++;
+            }
+            
+            if (fallback_offset >= len) {
+                break;
+            }
+            continue;
         }
         free(answer_domain);
         
-        if (offset + 10 >= len) {
+        if (*offset + 10 >= len) {
             break;  // Need at least 10 bytes for TYPE, CLASS, TTL, RDLENGTH
         }
         
         // Extract record information
-        uint16_t type = ntohs(*(uint16_t *)(packet + offset));
-        uint16_t class = ntohs(*(uint16_t *)(packet + offset + 2));
-        uint16_t rdlength = ntohs(*(uint16_t *)(packet + offset + 8));
+        uint16_t type = ntohs(*(uint16_t *)(packet + *offset));
+        uint16_t class = ntohs(*(uint16_t *)(packet + *offset + 2));
+        uint16_t rdlength = ntohs(*(uint16_t *)(packet + *offset + 8));
         
-        offset += 10;
+        *offset += 10;
         
         // Validate RDATA length
-        if (offset + rdlength > len) {
+        if (*offset + rdlength > len) {
             break;
         }
         
         // Process based on record type
         if (class == DNS_CLASS_IN) {
-            process_dns_record(packet, offset, type, rdlength, &ipv4_count, &ipv6_count);
+            process_dns_record(packet, *offset, type, rdlength, &ipv4_count, &ipv6_count);
         }
         
-        offset += rdlength;
+        *offset += rdlength;
     }
     
-    // Only print "none" messages if we didn't find any addresses
-    if (ipv4_count == 0 && ipv6_count == 0) {
-        printf("No IP addresses found\n");
-    }
+    return ipv4_count + ipv6_count;  // Return the count of addresses found
 }
 
 static void process_dns_record(const unsigned char *packet, int offset, uint16_t type, uint16_t rdlength, int *ipv4_count, int *ipv6_count) {
     switch (type) {
         case DNS_TYPE_A:
             if (rdlength == 4) {
-                if (*ipv4_count == 0) {
-                    printf("IPv4 addresses:\n");
-                }
                 uint32_t ipv4_addr = *(uint32_t *)(packet + offset);
                 print_ipv4_address(ipv4_addr);
                 (*ipv4_count)++;
@@ -369,78 +407,51 @@ static void process_dns_record(const unsigned char *packet, int offset, uint16_t
             
         case DNS_TYPE_AAAA:
             if (rdlength == 16) {
-                if (*ipv6_count == 0) {
-                    printf("IPv6 addresses:\n");
-                }
                 print_ipv6_address(packet + offset);
                 (*ipv6_count)++;
             }
+            break;
+            
+        default:
             break;
     }
 }
 
 char* extract_domain_name(const unsigned char *packet, int *offset, int max_len) {
-    // Extract domain name from DNS packet with basic compression support
+    // Extract domain name from DNS packet by scanning forward until null byte
     char domain[256] = {0};
     unsigned int domain_len = 0;
-    int original_offset = *offset;
+    int start_offset = *offset;
     
     // Check if offset is within bounds
     if (*offset >= max_len) {
         return NULL;
     }
     
+    // Scan forward until we find a null byte (end of domain name)
     while (*offset < max_len) {
-        uint8_t len = packet[*offset];
+        uint8_t byte = packet[*offset];
         (*offset)++;
         
-        if (len == 0) {
+        if (byte == 0) {
             break;  // End of domain name
         }
         
-        // Handle compression pointer (simplified)
-        if (len & 0xC0) {
-            if (*offset >= max_len) return NULL;
-            uint16_t pointer = ((len & 0x3F) << 8) | packet[*offset];
-            (*offset)++;
-            
-            // Basic pointer validation
-            if (pointer >= max_len || pointer >= original_offset) {
-                return NULL;
-            }
-            
-            // Follow pointer once (no recursion to avoid complexity)
-            int temp_offset = pointer;
-            while (temp_offset < max_len) {
-                uint8_t temp_len = packet[temp_offset];
-                temp_offset++;
-                
-                if (temp_len == 0) break;
-                
-                if (temp_len & 0xC0) {
-                    // Nested compression not supported (simplified)
-                    return NULL;
-                }
-                
-                if (temp_offset + temp_len > max_len) return NULL;
-                if (domain_len + temp_len + 1 >= sizeof(domain)) return NULL;
-                
-                if (domain_len > 0) {
-                    domain[domain_len++] = '.';
-                }
-                
-                memcpy(domain + domain_len, packet + temp_offset, temp_len);
-                domain_len += temp_len;
-                temp_offset += temp_len;
-            }
-            break;
+        // Check if this is a compression pointer
+        if (byte & 0xC0) {
+            // This is a compression pointer, we can't handle it
+            // Reset offset and return NULL
+            *offset = start_offset;
+            return NULL;
         }
         
-        // Check if we have enough data for this label
-        if (*offset + len > max_len) return NULL;
+        // This is a length byte, skip the label data
+        if (*offset + byte > max_len) {
+            return NULL;  // Label extends beyond packet
+        }
         
         // Check if adding this label would exceed domain buffer
-        if (domain_len + len + 1 >= sizeof(domain)) {
+        if (domain_len + byte + 1 >= sizeof(domain)) {
             return NULL;  // Domain name too long
         }
         
@@ -448,9 +459,9 @@ char* extract_domain_name(const unsigned char *packet, int *offset, int max_len)
             domain[domain_len++] = '.';
         }
         
-        memcpy(domain + domain_len, packet + *offset, len);
-        domain_len += len;
-        *offset += len;
+        memcpy(domain + domain_len, packet + *offset, byte);
+        domain_len += byte;
+        *offset += byte;
     }
     
     if (domain_len == 0) {
@@ -508,4 +519,50 @@ void print_usage(const char *program_name) {
     }
     
     pcap_freealldevs(alldevs);
+}
+
+static int skip_dns_records(const unsigned char *packet, int len, int offset, uint16_t count) {
+    // Skip DNS records by scanning forward until null bytes
+    for (int i = 0; i < count; i++) {
+        if (offset >= len) {
+            return offset;  // End of packet
+        }
+        
+        // Skip domain name by scanning forward until null byte
+        while (offset < len) {
+            uint8_t byte = packet[offset];
+            offset++;
+            
+            if (byte == 0) {
+                break;  // End of domain name
+            }
+            
+            // Check if this is a compression pointer
+            if (byte & 0xC0) {
+                // This is a compression pointer, we can't handle it
+                // Skip the second byte and continue
+                if (offset < len) {
+                    offset++;
+                }
+                break;  // Compression pointer ends the domain name
+            }
+            
+            // This is a length byte, skip the label data
+            if (offset + byte > len) {
+                return offset;  // Label extends beyond packet
+            }
+            offset += byte;
+        }
+        
+        // Skip record header (TYPE, CLASS, TTL, RDLENGTH = 10 bytes)
+        if (offset + 10 > len) {
+            return offset;  // End of packet
+        }
+        
+        // Get RDATA length and skip it
+        uint16_t rdlength = ntohs(*(uint16_t *)(packet + offset + 8));
+        offset += 10 + rdlength;
+    }
+    
+    return offset;
 } 
