@@ -50,6 +50,7 @@ struct dns_header {
 // Global variables
 pcap_t *handle = NULL;
 char *dev = NULL;
+int dev_allocated = 0;  // Flag to track if dev was dynamically allocated
 
 // Function prototypes
 void cleanup(int sig);                                                    // Signal handler for graceful shutdown
@@ -106,6 +107,7 @@ int main(int argc, char *argv[]) {
                 continue;  // Skip loopback devices
             }
             dev = strdup(d->name);  // Copy the device name
+            dev_allocated = 1;      // Mark as dynamically allocated
             break;
         }
         
@@ -165,7 +167,7 @@ void cleanup(int sig) {
         pcap_close(handle);
     }
     // Free the device name if it was allocated
-    if (dev) {
+    if (dev && dev_allocated) {
         free(dev);
     }
     exit(EXIT_SUCCESS);
@@ -244,7 +246,7 @@ static const unsigned char* extract_dns_from_udp(const unsigned char *packet, co
 }
 
 void parse_dns_packet(const unsigned char *packet, int len) {
-    // Parse DNS response: extract domain names, A/AAAA records, and CNAME records
+    // Parse DNS response: extract domain names, A/AAAA records
     if (len < MAX_DNS_HEADER) {
         printf("DROP: DNS packet too short (len=%d, min=%d)\n", len, MAX_DNS_HEADER);
         return;
