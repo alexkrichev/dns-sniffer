@@ -68,7 +68,7 @@ static void parse_ipv6_packet(const unsigned char *packet, const struct pcap_pkt
 static const unsigned char* extract_dns_from_udp(const unsigned char *packet, const struct pcap_pkthdr *header, unsigned int ip_offset);
 static int process_answer_records(const unsigned char *packet, int len, int *offset, uint16_t ancount);
 static void process_dns_record(const unsigned char *packet, int offset, uint16_t type, uint16_t rdlength, int *ipv4_count, int *ipv6_count);
-static int skip_dns_records(const unsigned char *packet, int len, int offset, uint16_t count);
+static int skip_dns_records(const unsigned char *packet, int len, int *offset, uint16_t count);
 
 int main(int argc, char *argv[]) {
     // Main entry point: initialize pcap, set up signal handlers, and start packet capture
@@ -311,7 +311,10 @@ void parse_dns_packet(const unsigned char *packet, int len) {
     int answer_addresses = process_answer_records(packet, len, &offset, ancount);
     
     // Skip authority records (they don't contain IP addresses)
-    offset = skip_dns_records(packet, len, offset, nscount);
+    if (skip_dns_records(packet, len, &offset, nscount) != 0) {
+        printf("Error: Failed to skip authority records\n");
+        return;
+    }
     
     // Process additional records (may contain A/AAAA records)
     int additional_addresses = process_answer_records(packet, len, &offset, arcount);
@@ -391,7 +394,6 @@ char* extract_domain_name(const unsigned char *packet, int *offset, int max_len)
     // Extract domain name from DNS packet by scanning forward until null byte
     char domain[256] = {0};
     unsigned int domain_len = 0;
-    int start_offset = *offset;
     
     // Check if offset is within bounds
     if (*offset >= max_len) {
@@ -405,14 +407,6 @@ char* extract_domain_name(const unsigned char *packet, int *offset, int max_len)
         
         if (byte == 0) {
             break;  // End of domain name
-        }
-        
-        // Check if this is a compression pointer
-        if (byte & 0xC0) {
-            // This is a compression pointer, we can't handle it
-            // Reset offset and return NULL
-            *offset = start_offset;
-            return NULL;
         }
         
         // This is a length byte, skip the label data
@@ -491,48 +485,49 @@ void print_usage(const char *program_name) {
     pcap_freealldevs(alldevs);
 }
 
-static int skip_dns_records(const unsigned char *packet, int len, int offset, uint16_t count) {
-    // Skip DNS records by scanning forward until null bytes
+static int skip_dns_records(const unsigned char *packet, int len, int *offset, uint16_t count) {
+    // Skip DNS records
     for (int i = 0; i < count; i++) {
-        if (offset >= len) {
-            return offset;  // End of packet
+        if (*offset >= len) {
+            *offset = len;  // Set to end of packet
+            return -1;  // Error - packet truncated, expected more records
         }
         
         // Skip domain name by scanning forward until null byte
-        while (offset < len) {
-            uint8_t byte = packet[offset];
-            offset++;
+        while (*offset < len) {
+            uint8_t byte = packet[*offset];
+            (*offset)++;
             
             if (byte == 0) {
                 break;  // End of domain name
             }
             
-            // Check if this is a compression pointer
-            if (byte & 0xC0) {
-                // This is a compression pointer, we can't handle it
-                // Skip the second byte and continue
-                if (offset < len) {
-                    offset++;
+            // Check for DNS compression pointer (0xC0 prefix)
+            if ((byte & 0xC0) == 0xC0) {
+                // This is a compression pointer, skip the second byte
+                if (*offset >= len) {
+                    *offset = len;
+                    return -1;
                 }
-                break;  // Compression pointer ends the domain name
+                (*offset)++;  // Skip the second byte of the pointer
+                break;  // Compression pointers always end the domain name
             }
-            
-            // This is a length byte, skip the label data
-            if (offset + byte > len) {
-                return offset;  // Label extends beyond packet
-            }
-            offset += byte;
         }
         
         // Skip record header (TYPE, CLASS, TTL, RDLENGTH = 10 bytes)
-        if (offset + 10 > len) {
-            return offset;  // End of packet
+        if (*offset + 10 > len) {
+            *offset = len;  // Set to end of packet
+            return -1;  // Error
         }
         
         // Get RDATA length and skip it
-        uint16_t rdlength = ntohs(*(uint16_t *)(packet + offset + 8));
-        offset += 10 + rdlength;
+        uint16_t rdlength = ntohs(*(uint16_t *)(packet + *offset + 8));
+        if (*offset + 10 + rdlength > len) {
+            *offset = len;  // Set to end of packet on error
+            return -1;  // Error
+        }
+        *offset += 10 + rdlength;
     }
     
-    return offset;
+    return 0;  // Success
 } 

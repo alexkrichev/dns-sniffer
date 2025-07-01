@@ -45,8 +45,6 @@ SUBDOMAINS=("www.google.com" "www.github.com" "docs.github.com" "help.github.com
 DOMAINS=("${BASIC_DOMAINS[@]}" "${SUBDOMAINS[@]}")
 
 for domain in "${DOMAINS[@]}"; do
-    echo "Querying: $domain"
-    
     # Query IPv4 addresses (A records)
     dig $domain A > /dev/null 2>&1
     
